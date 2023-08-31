@@ -1,0 +1,1888 @@
+---
+title: 'Pronóstico de Inflación: Honduras'
+author: Elvis Casco
+execute:
+  echo: false
+format: 
+  html:
+    toc: true
+    warnings: false
+# format: 
+#   pdf:
+#     toc: true
+#     warnings: false
+keep-ipynb: true
+lang: es
+jupyter: python3
+---
+
+[Code](https://colab.research.google.com/drive/1A8KfPOvwZFH3b2rVtDcGgm65_DJlHeAb#scrollTo=131f56c2-a92c-416f-b490-9684e1301a7c)
+
+```{python}
+# Libraries
+# !pip install pmdarima
+import math
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pandas_datareader.data as web
+import plotly.express as px
+import plotly.graph_objects as go
+import pylab
+import requests # for IMF data
+import scipy.stats as stats
+import seaborn as sns
+import statsmodels.api as sm
+from datetime import datetime
+from plotly.subplots import make_subplots
+from pmdarima.arima import ADFTest
+from pmdarima.arima import auto_arima
+from scipy.stats import shapiro
+from sklearn import linear_model
+from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import TweedieRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+from statsmodels.tsa.stattools import adfuller
+```
+
+# 1. Índice de Precios al Consumidor (IPC)
+
+```{python}
+sns.set_style('whitegrid')
+pd.plotting.register_matplotlib_converters()
+# Default figure size
+sns.mpl.rc('figure', figsize=(16, 6))
+```
+
+El IPC es un indicador utilizado para medir el cambio promedio en el tiempo de los precios pagados por los consumidores del área urbana por una canasta de bienes y servicios. Se utiliza la fórmula de Laspeyres (ver [metodología](https://www.bch.hn/EN/Estadisticos/gie/LIBConsumer%20Price/Metodolog%C3%ADa%20IPC%201999.pdf)):
+
+$$I_i= \frac{\sum P_iQ_0}{\sum P_0Q_0}$$
+
+$P_i$ = precio en el mes $i$;
+
+$Q_0$ = cantidad en el mes base (diciembre 1999);
+
+$P_0$ = precio en el mes base.
+
+En Honduras, el IPC es una media geométrica ponderada de 282 componentes. Se tienen datos del IPC por 12 agrupaciones, de acuerdo a los siguientes pesos:
+
+```{python}
+groups=['Food and Non-Alcoholic Beverages',
+        'Alcoholic Beverages and Tobacco',
+        'Apparel',
+        'Housing, Water, Electricity, Gas and Other Fuel',
+        'Furnishing, Housing Equipment and Routine House Maintenance',
+        'Medical Care',
+        'Transportation Services',
+        'Communication Services',
+        'Recreation and Culture',
+        'Education',
+        'Restaurants and Hotels',
+        'Personal Care']
+Spanish=["Alimentos y Bebidas no Alcohólicas",
+         "Bebidas Alcohólicas y Tabaco",
+         "Prendas de Vestir y Calzado",
+         "Alojamiento, Agua, Electricidad, Gas y Otros Combustibles",
+         "Muebles y Artículos para la Conservación del Hogar",
+         "Salud",
+         "Transporte",
+         "Comunicaciones",
+         "Recreación y Cultura",
+         "Educación",
+         "Restaurantes y Hoteles",
+         "Cuidado Personal"]
+weights=[31.81, 0.36, 8.17, 19.25, 6.67, 3.65, 9.05, 1.69, 3.97, 3.05, 7.15, 5.18]
+df=pd.DataFrame({'Grupos':Spanish,
+                 'Peso':weights})
+```
+
+En el archivo correspondiente al informe mensual se detalla el [comportamiento por grupos
+](https://www.bch.hn/EN/Estadisticos/gie/_layouts/15/WopiFrame.aspx?sourcedoc=%7B45BC85E5-1D66-487C-B90B-F32EE121C3F4%7D&file=Tables%20CPI%20April%202022.xls&action=default), hoja "Cuadro4". Los datos de los índices mensuales para [cada grupo](https://www.bch.hn/estadisticos/GIE/LIBSERIE%20IPC%20RUBROS/Serie%20Mensual%20y%20Promedio%20Anual%20del%20%C3%8Dndice%20de%20Precios%20al%20Consumidor%20por%20Rubros.xlsx) y la información sobre el comportamiento del IPC en cada mes está disponible en la página web del [BCH](https://www.bch.hn/estadisticas-y-publicaciones-economicas/publicaciones-de-precios/series-ipc).
+
+```{python}
+# Read Excel data
+url = "https://www.bch.hn/estadisticos/GIE/LIBSERIE%20IPC%20RUBROS/Serie%20Mensual%20y%20Promedio%20Anual%20del%20%C3%8Dndice%20de%20Precios%20al%20Consumidor%20por%20Rubros.xlsx"
+df_cpi = pd.read_excel(url)
+
+# Drop columns and rows with missing values
+df_cpi = df_cpi.dropna(axis=1, thresh=3)
+df_cpi = df_cpi.dropna(axis=0, thresh=3)
+df_cpi = df_cpi.dropna(axis=1)
+
+# Drop first row (name of variables in Spanish)
+df_cpi = df_cpi.drop(df_cpi.index[0])
+
+# Rename columns
+df_cpi.columns = ["Fechas",
+                  "Alimentos y Bebidas no Alcohólicas",
+                  "Bebidas Alcohólicas y Tabaco",
+                  "Prendas de Vestir y Calzado",
+                  "Alojamiento, Agua, Electricidad, Gas y Otros Combustibles",
+                  "Muebles y Artículos para la Conservación del Hogar",
+                  "Salud",
+                  "Transporte",
+                  "Comunicaciones",
+                  "Recreación y Cultura",
+                  "Educación",
+                  "Restaurantes y Hoteles",
+                  "Cuidado Personal",
+                  "IPC"]
+
+# Drop rows containing "PROMEDIO"
+df_cpi = df_cpi[df_cpi["Fechas"].str.contains("PROMEDIO") == False]
+df_cpi
+
+# Add dates
+n = df_cpi.shape[0]
+df_cpi.drop(['Fechas'], axis=1, inplace = True)
+df_cpi.index = pd.date_range(start='01/01/1991', periods=n, freq='M')
+```
+
+
+
+```{python}
+df_cpi.tail()
+```
+
+
+
+```{python}
+fig = px.line(df_cpi['IPC'],
+              title = 'Honduras: Índice de Precios al Consumidor, 1991-2022',
+              template = 'plotly_white',
+              labels=dict(x="Months", y=""))
+fig.update_layout(
+    autosize=False,
+    width=700,
+    height=500,
+    showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.update_xaxes(title_text='')
+fig.update_yaxes(title_text='')
+```
+
+
+
+```{python}
+from matplotlib import colorbar
+col = Spanish
+
+# plotly setup
+plot_rows=6
+plot_cols=2
+fig = make_subplots(
+    rows=plot_rows,
+    cols=plot_cols,
+    subplot_titles=(df_cpi.columns[0:12]))
+
+# add traces
+c = 0
+df = df_cpi
+for i in range(1, plot_rows + 1):
+    for j in range(1, plot_cols + 1):
+        fig.add_trace(go.Scatter(
+            x=df[df.columns[c]].index,
+            y=df[df.columns[c]].values,
+            name = df.columns[c]),
+            row=i,
+            col=j)
+        fig.update_layout(
+            template = 'plotly_white',
+            #autosize=False,
+            #width=700,
+            #height=500,
+            showlegend=False)
+        c=c+1
+
+# Format and show fig
+fig.update_layout(
+    height=2500,
+    width=1200,
+    title_text="Componentes del IPC: Base Diciembre 1999").update_xaxes(
+    title_text='').update_yaxes(
+        title_text='').update_layout(
+            showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.show()
+```
+
+
+
+```{python}
+col = Spanish
+i = 1   # Elegir de 0 (cero) a 11 (once)
+fig = px.line(df_cpi[col[i]],
+              title="IPC: " + col[i],
+              template='plotly_white',
+              labels=dict(x="Months", y=""))
+fig.update_layout(
+    autosize=False,
+    width=700,
+    height=500,
+    showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.update_xaxes(title_text='')
+fig.update_yaxes(title_text='')
+```
+
+## 1.1 Tasa de Inflación
+
+En el mes $t$, la tasa de inflación (crecimiento interanual) se define como:
+
+$\pi_t=\frac{IPC_t-IPC_{t-12}}{IPC_{t-12}}*100$
+
+```{python}
+df_cpi['Inflacion'] = df_cpi.IPC.pct_change(12) * 100
+```
+
+
+
+```{python}
+fig = px.line(df_cpi['Inflacion'],
+              title='Honduras: Inflación (%), 1991-2022',
+              template='plotly_white')
+fig.update_layout(
+    autosize=False,
+    width=700,
+    height=500,
+    showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.update_xaxes(title_text='')
+fig.update_yaxes(title_text='')
+```
+
+
+
+```{python}
+fig = px.histogram(df_cpi['Inflacion'],
+                   title='Honduras: Distribución de la Inflación (%), 1991-2022',
+                   template='plotly_white',
+                   histnorm='percent',
+                   color_discrete_sequence=['indianred'])
+fig.update_layout(
+    autosize=False,
+    width=700,
+    height=500,
+    showlegend=False)
+fig.update_xaxes(title_text='')
+fig.update_yaxes(title_text='')
+fig.show()
+```
+
+La mayoría de los datos muestran inflación interanual por debajo de 10%; las tasas de crecimiento mayores a ese parámetro corresponden a meses antes de 2000 y durante la crisis de 2008-2009.
+
+## 1.2 Tasa de Inflación, por Grupos
+
+```{python}
+df_inflacion_grupos = df_cpi.pct_change(12) * 100
+```
+
+
+
+```{python}
+col = Spanish
+
+# plotly setup
+plot_rows=6
+plot_cols=2
+fig = make_subplots(
+    rows=plot_rows,
+    cols=plot_cols,
+    subplot_titles=(df_cpi.columns[0:12]))
+
+# add traces
+c = 0
+df = df_inflacion_grupos
+for i in range(1, plot_rows + 1):
+    for j in range(1, plot_cols + 1):
+        fig.add_trace(go.Scatter(
+            x=df[df.columns[c]].index,
+            y=df[df.columns[c]].values,
+            name = df.columns[c]),
+            row=i,
+            col=j)
+        fig.update_layout(template = 'plotly_white')
+        c=c+1
+
+# Format and show fig
+fig.update_layout(
+    height=2500,
+    width=1200,
+    title_text="IPC: Inflación por Grupos").update_xaxes(
+    title_text='').update_yaxes(
+        title_text='').update_layout(
+            showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.show()
+```
+
+Al igual que con la inflación general, antes de 1998 las tasas de inflación mostraban mayor volatilidad que en períodos recientes.
+
+```{python}
+col = Spanish
+
+# plotly setup
+plot_rows=6
+plot_cols=2
+fig = make_subplots(
+    rows=plot_rows,
+    cols=plot_cols,
+    subplot_titles=(df_cpi.columns[0:12]))
+
+# add traces
+c = 0
+df = df_inflacion_grupos
+for i in range(1, plot_rows + 1):
+    for j in range(1, plot_cols + 1):
+        fig.add_trace(go.Histogram(
+            x=df[df.columns[c]].values,
+            histnorm='percent',
+            marker={'color':'indianred'},
+            name = df.columns[c]),
+            row=i,
+            col=j)
+        fig.update_layout(template = 'plotly_white')
+        c=c+1
+
+# Format and show fig
+fig.update_layout(
+    height=2500,
+    width=1200,
+    title_text="Distribución de la Inflación por Grupos").update_xaxes(
+    title_text='').update_yaxes(
+        title_text='').update_layout(
+            showlegend=False)
+fig.show()
+```
+
+# 2. Índice de Precios de los Commodities
+
+Los datos se obtienen del Fondo Monetario Internacional (FMI)[(https://data.world/imf/primary-commodity-prices/file/COMMP_03-09-2017%2014-00-35-54_timeSeries.csv)].
+
+Honduras es una economía pequeña y abierta, y la oferta de bienes finales depende en muchos casos de las importaciones de materias primas y bienes finales. Luego, existe un mecanismo de transmisión directo (e indirecto) de los precios internacionales al IPC.
+
+```{python}
+# https://db.nomics.world/IMF/PCPS; Frequency: Monthly; Unit of Measure: Index
+xls_url = 'https://api.db.nomics.world/v22/series/IMF/PCPS.xlsx?limit=1000&q=&dimensions=%7B%22FREQ%22%3A%5B%22M%22%5D%2C%22UNIT_MEASURE%22%3A%5B%22IX%22%5D%2C%22REF_AREA%22%3A%5B%22W00%22%5D%7D'
+df_comm = pd.read_excel(xls_url)
+import re
+df_comm = df_comm.rename(columns=lambda x: re.sub('Monthly – All Countries, excluding the IO – Primary Commodity Prices, ','',x))
+
+to_select = ['period',
+             'Agriculture – Index (IMF/PCPS/M.W00.PAGRI.IX)',
+             'All index  – Index (IMF/PCPS/M.W00.PALLFNF.IX)',
+             'All Metals Index – Index (IMF/PCPS/M.W00.PALLMETA.IX)',
+             'Beverages index  – Index (IMF/PCPS/M.W00.PBEVE.IX)',
+             'Coal index  – Index (IMF/PCPS/M.W00.PCOAL.IX)',
+             'Commodities for Index: All, excluding Gold – Index (IMF/PCPS/M.W00.PEXGALL.IX)',
+             'All Metals EX GOLD Index – Index (IMF/PCPS/M.W00.PEXGMETA.IX)',
+             'Food and beverage index – Index (IMF/PCPS/M.W00.PFANDB.IX)',
+             'Fertilizer – Index (IMF/PCPS/M.W00.PFERT.IX)',
+             'Food index  – Index (IMF/PCPS/M.W00.PFOOD.IX)',
+             'Industrial Materials index  – Index (IMF/PCPS/M.W00.PINDU.IX)',
+             'Metal index  – Index (IMF/PCPS/M.W00.PMETA.IX)',
+             'Non-Fuel index  – Index (IMF/PCPS/M.W00.PNFUEL.IX)',
+             'Natural gas index  – Index (IMF/PCPS/M.W00.PNGAS.IX)',
+             'Energy index  – Index (IMF/PCPS/M.W00.PNRG.IX)',
+             'APSP crude oil($/bbl) – Index (IMF/PCPS/M.W00.POILAPSP.IX)',
+             'Precious Metals Price Index – Index (IMF/PCPS/M.W00.PPMETA.IX)',
+             'Agr. Raw Material Index  – Index (IMF/PCPS/M.W00.PRAWM.IX)']
+
+df_comm = df_comm[to_select]
+
+# Rename columns
+df_comm.columns = ['Fechas',
+                   'Agricultura', #Agriculture – Index (IMF/PCPS/M.W00.PAGRI.IX)
+                   'Commodities', #All index  – Index (IMF/PCPS/M.W00.PALLFNF.IX)
+                   'Metales', #All Metals Index – Index (IMF/PCPS/M.W00.PALLMETA.IX)
+                   'Bebidas', #Beverages index  – Index (IMF/PCPS/M.W00.PBEVE.IX)
+                   'Carbón', #Coal index  – Index (IMF/PCPS/M.W00.PCOAL.IX)
+                   'Commodities, excluyendo Oro', #Commodities for Index: All, excluding Gold – Index (IMF/PCPS/M.W00.PEXGALL.IX)
+                   'Metales, excluyendo Oro', #All Metals EX GOLD Index – Index (IMF/PCPS/M.W00.PEXGMETA.IX)
+                   'Alimentos y Bebidas', #Food and beverage index – Index (IMF/PCPS/M.W00.PFANDB.IX)
+                   'Fertilizantes', #Fertilizer – Index (IMF/PCPS/M.W00.PFERT.IX)
+                   'Alimentos', #Food index  – Index (IMF/PCPS/M.W00.PFOOD.IX)
+                   'Materiales Industriales', #Industrial Materials index  – Index (IMF/PCPS/M.W00.PINDU.IX)
+                   'Metal', #Metal index  – Index (IMF/PCPS/M.W00.PMETA.IX)
+                   'No Combustibles', #Non-Fuel index  – Index (IMF/PCPS/M.W00.PNFUEL.IX)
+                   'Gas Natural', #Natural gas index  – Index (IMF/PCPS/M.W00.PNGAS.IX)
+                   'Energía', #Energy index  – Index (IMF/PCPS/M.W00.PNRG.IX)
+                   'Petróleo', #APSP crude oil($/bbl) – Index (IMF/PCPS/M.W00.POILAPSP.IX)
+                   'Metales Preciosos', #Precious Metals Price Index – Index (IMF/PCPS/M.W00.PPMETA.IX)
+                   'Materias Primas'] #Agr. Raw Material Index  – Index (IMF/PCPS/M.W00.PRAWM.IX)
+
+# Add dates
+n = df_comm.shape[0]
+df_comm.drop(['Fechas'], axis=1, inplace = True)
+df_comm.index = pd.date_range(start='01/01/1990', periods=n, freq='M')
+```
+
+
+
+```{python}
+df_comm.tail()
+```
+
+
+
+```{python}
+col = df_comm.columns
+
+# plotly setup
+plot_rows=9
+plot_cols=2
+fig = make_subplots(
+    rows=plot_rows,
+    cols=plot_cols,
+    subplot_titles=(df_comm.columns))
+
+# add traces
+c = 0
+df = df_comm
+for i in range(1, plot_rows + 1):
+    for j in range(1, plot_cols + 1):
+        fig.add_trace(go.Scatter(
+            x=df[df.columns[c]].index,
+            y=df[df.columns[c]].values,
+            name = df.columns[c]),
+            row=i,
+            col=j)
+        fig.update_layout(template = 'plotly_white')
+        c=c+1
+
+# Format and show fig
+fig.update_layout(
+    height=2500,
+    width=1200,
+    title_text="Commodities: Índices").update_xaxes(
+    title_text='').update_yaxes(
+        title_text='').update_layout(
+            showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.show()
+```
+
+## 2.1 Precios de Commodities, Crecimiento Interanual
+
+```{python}
+df_comm_growth = df_comm.pct_change(12) * 100
+```
+
+
+
+```{python}
+col = df_comm_growth.columns
+
+# plotly setup
+plot_rows=9
+plot_cols=2
+fig = make_subplots(
+    rows=plot_rows,
+    cols=plot_cols,
+    subplot_titles=(df_comm_growth.columns))
+
+# add traces
+c = 0
+df = df_comm_growth
+for i in range(1, plot_rows + 1):
+    for j in range(1, plot_cols + 1):
+        fig.add_trace(go.Scatter(
+            x=df[df.columns[c]].index,
+            y=df[df.columns[c]].values,
+            name = df.columns[c]),
+            row=i,
+            col=j)
+        fig.update_layout(template = 'plotly_white')
+        c=c+1
+
+# Format and show fig
+fig.update_layout(
+    height=2500,
+    width=1200,
+    title_text="Precios de Commodities: Crecimiento Interanual").update_xaxes(
+    title_text='').update_yaxes(
+        title_text='').update_layout(
+            showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.show()
+```
+
+Todos los precios de los commodities observan incrementos significativos durante 2022, con mayor volatilidad respecto a sus valores históricos.
+
+```{python}
+col = df_comm_growth.columns
+
+# plotly setup
+plot_rows=9
+plot_cols=2
+fig = make_subplots(
+    rows=plot_rows,
+    cols=plot_cols,
+    subplot_titles=(df_comm_growth.columns))
+
+# add traces
+c = 0
+df = df_comm_growth
+for i in range(1, plot_rows + 1):
+    for j in range(1, plot_cols + 1):
+        fig.add_trace(go.Histogram(
+            x=df[df.columns[c]].values,
+            histnorm='percent',
+            marker={'color':'indianred'},
+            name = df.columns[c]),
+            row=i,
+            col=j)
+        fig.update_layout(template = 'plotly_white')
+        c=c+1
+
+# Format and show fig
+fig.update_layout(
+    height=2500,
+    width=1200,
+    title_text="Comportamiento del Precio de Commodities: Variación Interanual").update_xaxes(
+    title_text='').update_yaxes(
+        title_text='').update_layout(
+            showlegend=False)
+fig.show()
+```
+
+## 2.2 Precios del Petróleo WTI^[Crude Oil Prices: West Texas Intermediate (WTI) - Cushing, Oklahoma. Dollars per Barrel, Not Seasonally Adjusted.]
+
+```{python}
+start = datetime(1986, 1, 1)
+#end = datetime(2023, 5, 21)
+df_wti = web.DataReader('MCOILWTICO', 'fred', start)#, end)
+
+# Add dates
+n = df_wti.shape[0]
+#df_wti.drop(['DATE'], axis=1, inplace = True)
+df_wti.index = pd.date_range(start='01/01/1986', periods=n, freq='M')
+df_wti
+```
+
+
+
+```{python}
+fig = px.line(df_wti['MCOILWTICO'],
+              title="Crude Oil Prices: WTI - Dollars per Barrel",
+              template='plotly_white',
+              labels=dict(x="Months", y=""))
+fig.update_layout(
+    autosize=False,
+    width=700,
+    height=500,
+    showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.update_xaxes(title_text='')
+fig.update_yaxes(title_text='')
+```
+
+
+
+```{python}
+df_wti['WTI_Growth'] = df_wti.MCOILWTICO.pct_change(12) * 100
+```
+
+
+
+```{python}
+fig = px.line(df_wti['WTI_Growth'],
+              title = 'Crecimiento del Precio del Petroleo, WTI (%, Interanual)',
+              template = 'plotly_white',
+              labels=dict(x="Months", y=""))
+fig.update_layout(
+    autosize=False,
+    width=900,
+    height=600,
+    showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.update_xaxes(title_text='')
+fig.update_yaxes(title_text='')
+```
+
+# 3. Tipo de Cambio Nominal
+
+```{python}
+xls_url = 'https://www.bch.hn/estadisticos/GIE/LIBTipo%20de%20cambio%20Mensual/Tipo%20de%20Cambio%20Serie%20Mensual.xlsx'
+df_ner = pd.read_excel(xls_url)
+df_ner = df_ner[16:28]
+df_ner = df_ner.dropna(axis=1, how='all')
+df_ner.columns = np.arange(len(df_ner.columns))+1995
+n = df_ner.shape[0]
+k = df_ner.shape[1]
+
+# Melt DataFrame
+df_ner = pd.melt(df_ner, id_vars=df_ner.columns[0], value_vars=df_ner.columns[1:k])
+
+# Delete irrelevant columns and rows
+df_ner.drop(df_ner.columns[1], axis=1, inplace = True)
+df_ner.drop(df_ner.columns[0], axis=1, inplace = True)
+
+# Index dataframe
+n = df_ner.shape[0]
+df_ner.index = pd.date_range(start='01/01/1996', periods=n, freq='M')
+
+# Rename column
+df_ner.rename(columns = {'value':'Nom_Exch_Rate'}, inplace = True)
+df_ner = df_ner.dropna()
+```
+
+
+
+```{python}
+df_ner.head()
+```
+
+
+
+```{python}
+df_ner.tail()
+```
+
+
+
+```{python}
+fig = px.line(df_ner,
+              title = 'Honduras: Tipo de Cambio Nominal, 1996-2022',
+              template = 'plotly_white')
+fig.update_layout(
+    autosize=False,
+    width=700,
+    height=500,
+    showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.update_xaxes(title_text='')
+fig.update_yaxes(title_text='Lempiras x 1USD')
+```
+
+## 3.1 Depreciación Interanual del Lempira
+
+```{python}
+df_ner['Currency_Depreciation'] = df_ner.Nom_Exch_Rate.pct_change(12) * 100
+```
+
+
+
+```{python}
+fig = px.line(df_ner['Currency_Depreciation'],
+              title = 'Honduras: Depreciación Interanual del Lempira (%), 1991-2022',
+              template = 'plotly_white',
+              labels=dict(x="Months", y=""))
+fig.update_layout(
+    autosize=False,
+    width=700,
+    height=500,
+    showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.update_xaxes(title_text='')
+fig.update_yaxes(title_text='')
+```
+
+La depreciación del Tipo de Cambio Nominal en Honduras muestra tres períodos relevantes: antes de 2006, los movimientos eran determinados por los resultados en las operaciones del mercado cambiario, reguladas por el BCH mediante una regla que tomaba en cuenta los movimientos en los precios y tipos de cambio de Honduras respecto de sus principales socios comerciales. Durante 2006-2011 se modificó la regla con el fin de mantener el tipo de cambio fijo, y desde 2012 hasta esta fecha, se aplica una regla similar a la anterior.
+
+# 4. Oferta de Dinero
+
+Los datos de esta variable se encuentran disponibles en [la página web del BCH](https://www.bch.hn/estadisticos/EF/LIBEMFA/EMFA%20I%20y%20II.xlsx), en el archivo de las Estadísticas Monetarias y Financieras Armonizadas (EMFAs). La variable en análisis corresponde a "Billetes y monedas en circulación".
+
+```{python}
+xls_url = 'https://www.bch.hn/estadisticos/EF/LIBEMFA/EMFA%20I%20y%20II.xlsx'
+df_money = pd.read_excel(xls_url, sheet_name='I.1.Panorama BC')
+
+# Delete irrelevant columns and rows
+n = df_money.shape[0]
+df_money = df_money.drop(labels=[6,8,9], axis=0)
+df_money = df_money.drop(labels=[(n-8)], axis=0)
+cols_money = ['EMFA I','Unnamed: 14']
+df_money = pd.DataFrame(df_money, columns=cols_money)
+df_money = df_money.dropna(axis=0)
+
+# Drop irrelevant rows and columns, again
+df_money = df_money.drop('EMFA I', axis=1)
+
+# Index dataframe and rename column
+n = df_money.shape[0]
+df_money.index = pd.date_range(start='12/01/2001', periods=n, freq='M')
+df_money.columns.values[0] = 'Money'
+```
+
+
+
+```{python}
+df_money.head()
+```
+
+
+
+```{python}
+df_money.tail()
+```
+
+
+
+```{python}
+fig = px.line(df_money,
+              title = 'Honduras: Dinero en Circulación, 2002-2022',
+              template = 'plotly_white')
+fig.update_layout(
+    autosize=False,
+    width=700,
+    height=500,
+    showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.update_xaxes(title_text='')
+fig.update_yaxes(title_text='Millones de Lempiras')
+```
+
+La variable muestra un marcado patrón estacional, incrementando sus valores durante diciembre y con una tendencia decreciente en el resto de los meses.
+
+## 4.1 Crecimiento del Dinero (Variación Interanual)
+
+```{python}
+df_money['Money_Growth'] = df_money.Money.pct_change(12) * 100
+```
+
+
+
+```{python}
+fig = px.line(df_money['Money_Growth'],
+              title = 'Honduras: Crecimiento del Dinero (%, Interanual), 1991-2022',
+              template = 'plotly_white',
+              labels=dict(x="Months", y=""))
+fig.update_layout(
+    autosize=False,
+    width=900,
+    height=600,
+    showlegend=False)
+fig.update_traces(line_color='#CD5C5C', line_width=2)
+fig.update_xaxes(title_text='')
+fig.update_yaxes(title_text='')
+```
+
+# 5. Metodologías
+
+Se evalúan seis procedimientos (6) de regresión lineal, usando `scikit-learn` para las primeras cuatro.
+
+1. Mínimos Cuadrados Ordinarios (MCO);
+
+2. Lasso;
+
+3. Regresión Bayesiana (Ridge);
+
+4. Regresión Lineal Generalizada;
+
+5. ARIMA; y
+
+6. MCO sin selección aleatoria de las muestras.
+
+Se escogen los 10 últimos datos como muestra de validación `validation`; con los demás valores, se elige aleatoriamente el 70% para formar parte de la muestra de entrenamiento `train`, y el 30% restante sería la muestra de prueba `test`. De esta manera, se extraen valores para entrenar los datos (`X_train`, `y_train`), es decir, obtener los coeficientes; la evaluación fuera de muestra se realiza con los datos de prueba (`X_test`, `y_test`), aplicando los coeficientes obtenidos en el entrenamiento; igualmente dichos coeficientes se aplican para pronóstico de los últimos 10 datos, `validation`.
+
+Para evitar la influencia de las unidades de medida en las variables en la regresión, todas las variables se transforman a logaritmo natural. Esta forma de trabajo implica que los coeficientes de las regresiones estimadas pueden interpretarse como elasticidades.
+
+Las variables explicativas a incluir en las regresiones son:
+
+- Tipo de cambio nominal, para estimar lo que se conoce como pass-through;
+
+- Dinero en circulación, tomando en cuenta la ecuación cuantitativa del dinero, MV = PY;
+
+- Precios de los commodities, como una forma de medir el efecto de la inflación importada:
+  - Bebidas;
+  - Alimentos; y
+  - Fertilizantes.
+
+```{python}
+df_cpi.columns
+
+frames = [df_cpi['IPC'],
+          df_ner['Nom_Exch_Rate'],
+          df_money['Money'],
+          #df_comm['Beverages'],df_comm['Food'],df_comm['Fertilizer'],df_comm['Raw_Materials'],df_comm['Petroleum']]
+          #df_comm['Beverages'],df_comm['Food'],df_comm['Fertilizer'],df_comm['Raw_Materials']]
+          #df_comm['Beverages'],df_comm['Food'],df_comm['Fertilizer'],df_comm['Petroleum']]
+          df_comm['Bebidas'],df_comm['Alimentos'],df_comm['Fertilizantes'],
+          #df_wti['MCOILWTICO']]
+          df_cpi['Alojamiento, Agua, Electricidad, Gas y Otros Combustibles']]
+          #df_comm['All_Commodities']]
+df_variables = pd.concat(frames, axis=1)
+df_variables = df_variables.dropna(axis=0) # '01/01/2003'
+n = df_variables.shape[0]
+
+# Variables in logs
+df_reg = df_variables.to_numpy()
+if df_reg.dtype != np.dtype('float'):
+  df_reg = df_reg.astype('float')
+df_reg = pd.DataFrame(np.log(df_reg))
+df_reg.columns = df_variables.columns
+n = df_reg.shape[0]
+k = df_reg.shape[1]
+df_reg.index = pd.date_range(start='01/01/2003', periods=n, freq='M')
+
+# Dependent and Explanatory variables
+y = df_reg['IPC']
+X = df_reg.iloc[:, df_reg.columns!='IPC']
+
+# Split train_test, validation for the last 10 months
+X_train_test = X[:(n-10)]
+X_valid = X[(n-10):]
+y_train_test = y[:(n-10)]
+y_valid = y[(n-10):]
+```
+
+## 5.1 Matriz de Correlaciones
+
+Muestra si la relación es positiva o negativa.
+
+```{python}
+df_reg
+```
+
+
+
+```{python}
+df_corr = df_reg.corr()
+df_corr
+```
+
+
+
+```{python}
+sns.set(rc={"figure.figsize":(10, 10)}) #width=3, #height=4
+plt.figure(figsize=(12,8))
+ax = plt.axes()
+sns.heatmap(df_corr,annot=True,cmap='RdYlGn')
+ax.set_title('Heatmap: Variables en logs')
+```
+
+Todas las variables en logs tienen una correlación positiva y alta con el IPC en logs.
+
+## 5.2 Funciones
+
+Con el fin de ahorrar procedimientos en el código, se formularon los resultados en términos de funciones.
+
+### 5.2.1 Resultados: `train`, `test`, `validation`
+
+```{python}
+def results_model(y_train, X_train, y_test, X_test, y_valid, X_valid, model):
+  # Training: Observed
+  y_train = pd.DataFrame(y_train).sort_index()
+
+  # Training: Forecast
+  yf_train_m1 = model.predict(X_train)
+  yf_train_m1 = pd.DataFrame(yf_train_m1)
+  yf_train_m1.index = X_train.index
+  yf_train_m1.columns = ["yf_train_m1"]
+  yf_train_m1 = yf_train_m1.sort_index()
+
+  # Test: Observed
+  y_test = pd.DataFrame(y_test).sort_index()
+
+  # Test: Forecast
+  yf_test_m1 = model.predict(X_test)
+  yf_test_m1 = pd.DataFrame(yf_test_m1)
+  yf_test_m1.index = X_test.index
+  yf_test_m1.columns = ["yf_test_m1"]
+  yf_test_m1 = yf_test_m1.sort_index()
+
+  # Validation: Observed
+  y_valid = pd.DataFrame(y_valid).sort_index()
+
+  # Validation: Forecast
+  yf_valid_m1 = model.predict(X_valid)
+  yf_valid_m1 = pd.DataFrame(yf_valid_m1)
+  yf_valid_m1.index = X_valid.index
+  yf_valid_m1.columns = ["yf_valid_m1"]
+  yf_valid_m1 = yf_valid_m1.sort_index()
+  return y_train, yf_train_m1, y_test, yf_test_m1, y_valid, yf_valid_m1
+```
+
+### 5.2.2 Gráficos: `train`, `test`, `validation` versus datos observados
+
+```{python}
+def results_plots(y_train_m1, yf_train_m1, y_test_m1, yf_test_m1, y_valid_m1, yf_valid_m1):
+  fig, ax = plt.subplots(3)
+
+  # Train: Observed vs. Forecast
+  ax[0].scatter(yf_train_m1.index, yf_train_m1, label="IPC_train")
+  ax[0].scatter(y_train_m1.index, y_train_m1, label="IPC: Observado")
+  ax[0].legend(loc='upper left')
+
+  # Test: Observed vs. Forecast
+  ax[1].scatter(yf_test_m1.index, yf_test_m1, label="IPC_test")
+  ax[1].scatter(y_test_m1.index, y_test_m1, label="IPC: Observado")
+  ax[1].legend(loc='upper left')
+
+  # Validation: Observed vs. Forecast
+  ax[2].plot(yf_valid_m1, label="IPC_validation")
+  ax[2].plot(y_valid_m1, label="IPC: Observado")
+  ax[2].legend(loc='upper left')
+  fig.show()
+```
+
+## 5.3 Seleccionar Muestras, 70% `train`
+
+```{python}
+X_train, X_test, y_train, y_test = train_test_split(X_train_test, y_train_test, test_size=0.30, random_state=42)
+```
+
+# 6. Resultados
+
+## 6.1 MCO
+
+```{python}
+m1 = linear_model.LinearRegression()
+m1.fit(X_train, y_train)
+```
+
+
+
+```{python}
+m1.coef_
+```
+
+
+
+```{python}
+y_train_m1, yf_train_m1, y_test_m1, yf_test_m1, y_valid_m1, yf_valid_m1 = results_model(
+    y_train, X_train, y_test, X_test, y_valid, X_valid, m1)
+
+results_plots(y_train_m1, yf_train_m1, y_test_m1, yf_test_m1, y_valid_m1, yf_valid_m1)
+```
+
+## 6.2 Lasso
+
+```{python}
+m2 = linear_model.Lasso(alpha=0.0001)
+m2.fit(X_train, y_train)
+```
+
+
+
+```{python}
+y_train_m2, yf_train_m2, y_test_m2, yf_test_m2, y_valid_m2, yf_valid_m2 = results_model(
+    y_train, X_train, y_test, X_test, y_valid, X_valid, m2)
+
+results_plots(y_train_m2, yf_train_m2, y_test_m2, yf_test_m2, y_valid_m2, yf_valid_m2)
+```
+
+
+
+```{python}
+m2.coef_
+```
+
+## 6.3 Regresión Bayesiana (Ridge)
+
+```{python}
+m3 = linear_model.BayesianRidge()
+m3.fit(X_train, y_train)
+```
+
+
+
+```{python}
+m3.coef_
+```
+
+
+
+```{python}
+y_train_m3, yf_train_m3, y_test_m3, yf_test_m3, y_valid_m3, yf_valid_m3 = results_model(
+    y_train, X_train, y_test, X_test, y_valid, X_valid, m3)
+
+results_plots(y_train_m3, yf_train_m3, y_test_m3, yf_test_m3, y_valid_m3, yf_valid_m3)
+```
+
+## 6.4 Regresión Lineal Generalizada
+
+```{python}
+m4 = TweedieRegressor(power=1, alpha=0.5, link='log')
+m4.fit(X_train, y_train)
+```
+
+
+
+```{python}
+m4.coef_
+```
+
+
+
+```{python}
+y_train_m4, yf_train_m4, y_test_m4, yf_test_m4, y_valid_m4, yf_valid_m4 = results_model(
+    y_train, X_train, y_test, X_test, y_valid, X_valid, m4)
+
+results_plots(y_train_m4, yf_train_m4, y_test_m4, yf_test_m4, y_valid_m4, yf_valid_m4)
+```
+
+## 6.5. ARIMA
+
+La función `auto_arima` selecciona el modelo con el menor criterio de AkaIke (AIC).
+
+```{python}
+arima_model = auto_arima(y_train_test,
+                         start_p=0, d=1, start_q=0,
+                         max_p=5, max_d=3, max_q=5,
+                         start_P=0, D=1, start_Q=0,
+                         max_P=5, max_D=3, max_Q=5,
+                         m=12, seasonal=True,
+                         error_action='ignore', trace=True,
+                         supress_warnings=True, stepwise=True,
+                         random_state=20, n_fits=50)
+```
+
+
+
+```{python}
+arima_model.summary()
+```
+
+
+
+```{python}
+# Training: Observed
+y_train_test = pd.DataFrame(y_train_test).sort_index()
+
+# Validation: Observed
+y_valid = pd.DataFrame(y_valid).sort_index()
+
+# Validation: Forecast
+yf_valid_mARIMA = pd.DataFrame(arima_model.predict(n_periods=10), index=y_valid.index)
+yf_valid_mARIMA = pd.DataFrame(yf_valid_mARIMA)
+yf_valid_mARIMA.columns = ["yf_valid_mARIMA"]
+yf_valid_mARIMA = yf_valid_mARIMA.sort_index()
+```
+
+
+
+```{python}
+# Validation: Observed vs. Forecast
+plt.figure(figsize=(8,5))
+plt.plot(yf_valid_mARIMA, label="CPI_valid_ARIMA")
+plt.plot(y_valid, label="CPI: Observed")
+plt.legend(loc='upper left')
+```
+
+## 6.6. MCO sin selección aleatoria de las muestras
+
+```{python}
+# Split train and test, test for the last 10 months
+X_train_test = X[:(n-10)]
+X_valid = X[(n-10):]
+y_train_test = y[:(n-10)]
+y_valid = y[(n-10):]
+```
+
+
+
+```{python}
+# Linear model
+X_train_test = sm.add_constant(X_train_test) # Adding a constant (y-axis incercept)
+model_6 = sm.OLS(y_train_test, X_train_test).fit()
+model_6.summary()
+```
+
+
+
+```{python}
+m6 = linear_model.LinearRegression()
+X_train_test = X[:(n-10)]
+m6.fit(X_train_test, y_train_test)
+```
+
+
+
+```{python}
+m6.coef_
+```
+
+
+
+```{python}
+stats.probplot(model_6.resid, dist="norm", plot=pylab)
+plt.show()
+```
+
+
+
+```{python}
+# Run the normality test
+stat, p = shapiro(model_6.resid)
+print('Statistics={}, p={}'.format(stat, p))
+
+# Interpret results
+alpha = 0.05
+if p > alpha:
+    print('Sample looks Gaussian (fail to reject H0)')
+else:
+    print('Sample does not look Gaussian (reject H0)')
+```
+
+Los residuos no se ajustan a una distribución normal.
+
+```{python}
+# Training: Observed
+y_train_test = pd.DataFrame(y_train_test).sort_index()
+
+# Training: Forecast
+yf_train_test_m6 = m6.predict(X_train_test)
+yf_train_test_m6 = pd.DataFrame(yf_train_test_m6)
+yf_train_test_m6.index = X_train_test.index
+yf_train_test_m6.columns = ["yf_train_test_m6"]
+yf_train_test_m6 = yf_train_test_m6.sort_index()
+
+# Validation: Observed
+y_valid = pd.DataFrame(y_valid).sort_index()
+
+# Validation: Forecast
+yf_valid_m6 = m6.predict(X_valid)
+yf_valid_m6 = pd.DataFrame(yf_valid_m6)
+yf_valid_m6.index = X_valid.index
+yf_valid_m6.columns = ["yf_valid_m6"]
+yf_valid_m6 = yf_valid_m6.sort_index()
+```
+
+
+
+```{python}
+# Validation: Observed vs. Forecast
+plt.figure(figsize=(8,5))
+plt.plot(yf_valid_m6, label="CPI_valid_m6")
+plt.plot(y_valid, label="CPI: Observed")
+plt.legend(loc='upper left')
+plt.show()
+```
+
+# 6.7. Resumen de resultados
+
+### 6.7.1 Tabla
+
+```{python}
+# Original data
+frames = [y_train, y_test, y_valid]
+Orig = pd.concat(frames, axis=1)
+Orig['log_CPI'] = Orig.sum(axis=1, skipna=True)
+Orig = Orig['log_CPI']
+
+# Model 1
+frames = [y_train, y_test, yf_valid_m1]
+Model_1 = pd.concat(frames, axis=1)
+Model_1['log_CPI_f_m1'] = Model_1.sum(axis=1, skipna=True)
+Model_1 = Model_1['log_CPI_f_m1']
+
+# Model 2
+frames = [y_train, y_test, yf_valid_m2]
+Model_2 = pd.concat(frames, axis=1)
+Model_2['log_CPI_f_m2'] = Model_2.sum(axis=1, skipna=True)
+Model_2 = Model_2['log_CPI_f_m2']
+
+# Model 3
+frames = [y_train, y_test, yf_valid_m3]
+Model_3 = pd.concat(frames, axis=1)
+Model_3['log_CPI_f_m3'] = Model_3.sum(axis=1, skipna=True)
+Model_3 = Model_3['log_CPI_f_m3']
+
+# Model 4
+frames = [y_train, y_test, yf_valid_m4]
+Model_4 = pd.concat(frames, axis=1)
+Model_4['log_CPI_f_m4'] = Model_4.sum(axis=1, skipna=True)
+Model_4 = Model_4['log_CPI_f_m4']
+
+# Model 5: ARIMA
+frames = [y_train_test, yf_valid_mARIMA]
+Model_5 = pd.concat(frames, axis=1)
+Model_5['log_CPI_f_mARIMA'] = Model_5.sum(axis=1, skipna=True)
+Model_5 = Model_5['log_CPI_f_mARIMA']
+
+# Model 6: OLS with non-random train-test set
+frames = [y_train_test, yf_valid_m6]
+Model_6 = pd.concat(frames, axis=1)
+Model_6['log_CPI_f_m6'] = Model_6.sum(axis=1, skipna=True)
+Model_6 = Model_6['log_CPI_f_m6']
+
+# Results dataframe
+frames = [Orig, Model_1, Model_2, Model_3, Model_4, Model_5, Model_6]
+Results = pd.concat(frames, axis=1)
+Results[-15:]
+```
+
+### 6.7.2 Gráfico
+
+```{python}
+plt.figure(figsize=(8,5))
+plt.plot(Model_1[-20:], label="OLS")
+#plt.plot(Model_2[-20:], label="Lasso")
+plt.plot(Model_3[-20:], label="Bayesian Ridge")
+plt.plot(Model_4[-20:], label="Generalized Ridge")
+plt.plot(Model_5[-20:], label="ARIMA")
+plt.plot(Model_6[-20:], label="OLS_split_not_random")
+plt.plot(Orig[-20:], label="Observed",linewidth=4.0)
+plt.legend(loc='upper left')
+plt.title('Resultados de los Modelos: log del CPI')
+plt.show()
+```
+
+
+
+```{python}
+#import plotly.graph_objects as go
+fig = px.line(Orig[-15:],
+              template = 'plotly_white',
+              title="Resultados de los Modelos")
+fig.add_scatter(x=Model_1[-15:].index, y=Model_1[-15:], name='log_IPC_f_m1_mco')
+fig.add_scatter(x=Model_2[-15:].index, y=Model_2[-15:], name='log_IPC_f_m2_lasso')
+fig.add_scatter(x=Model_3[-15:].index, y=Model_3[-15:], name='log_IPC_f_m3_bayesian')
+fig.add_scatter(x=Model_4[-15:].index, y=Model_4[-15:], name='log_IPC_f_m4_generalizada')
+fig.add_scatter(x=Model_5[-15:].index, y=Model_5[-15:], name='log_IPC_f_m5_ARIMA')
+fig.add_scatter(x=Model_6[-15:].index, y=Model_6[-15:], name='log_IPC_f_m_6_mco_no_aleatorio')
+fig.update_layout(
+    autosize=False,
+    width=800,
+    height=500,
+    showlegend=True)
+fig.update_xaxes(title_text='')
+fig.update_yaxes(title_text='log del IPC')
+```
+
+En la muestra de validación (10 meses), todos los modelos lineales presentan valores menores a los observados. El ARIMA muestra valores menores y es muy cercano a los datos en los primeros cuatro meses.
+
+## 6.7.3 Raíz del Error Cuadrático Medio (RMSE)
+
+Se usa para evaluar el resultado de pronóstico en los últimos 10 valores de pronóstico respecto de los datos observados.
+
+```{python}
+rmse_m1 = np.sqrt(mean_squared_error(Results['log_CPI'][-10:], Results['log_CPI_f_m1'][-10:]))
+rmse_m2 = np.sqrt(mean_squared_error(Results['log_CPI'][-10:], Results['log_CPI_f_m2'][-10:]))
+rmse_m3 = np.sqrt(mean_squared_error(Results['log_CPI'][-10:], Results['log_CPI_f_m3'][-10:]))
+rmse_m4 = np.sqrt(mean_squared_error(Results['log_CPI'][-10:], Results['log_CPI_f_m4'][-10:]))
+rmse_mARIMA = np.sqrt(mean_squared_error(Results['log_CPI'][-10:], Results['log_CPI_f_mARIMA'][-10:]))
+rmse_m6 = np.sqrt(mean_squared_error(Results['log_CPI'][-10:], Results['log_CPI_f_m6'][-10:]))
+models = ["OLS","LASSO","Bayesian Ridge","Generalized Linear","ARIMA","Regression"]
+d = {'Models': models, 'RMSE': pd.Series([rmse_m1, rmse_m2, rmse_m3, rmse_m4, rmse_mARIMA, rmse_m6])}
+pd.DataFrame(data=d)
+```
+
+ARIMA models have the lower RMSE, observing higher accuracy compared with the rest of the models.
+
+## 6.7.4 Elasticitidades: Coefficientes de los Modelos Lineales
+
+```{python}
+variables = m1.feature_names_in_
+d = {'Variables': variables, 'OLS': m1.coef_, 'Lasso': m2.coef_, 'Bayesian Ridge': m3.coef_, 'Regression': m6.coef_}
+pd.DataFrame(data=d)
+```
+
+# 7. Conclusión
+
+# 8. Referencias
+
+- Burkov, Andriy. 2019. *The Hundred-Page Machine Learning Book*. Burkov, Andriy.
+
+- Hyndman, Rob J. and Athanasopoulos, George. 2021. *Forecasting: Principles and Practice*.
+
+- Mankiw, N. Gregory. 2016. *Macroeconomics, 9th Edition*. Worth Publishers.
+
+- [scikit-learn library: linear models](https://scikit-learn.org/stable/modules/linear_model.html#)
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
+
+
+
+```{python}
+
+```
